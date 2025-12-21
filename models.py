@@ -794,14 +794,20 @@ class SASRec(nn.Module):
         seq_emb = self.layer_norm(seq_emb + pos_emb)
         seq_emb = self.emb_dropout(seq_emb)
         
-        # 创建因果掩码 (causal mask)
+        # 创建因果掩码 (causal mask) - 使用 bool 类型
         causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=item_seq.device) * float('-inf'),
+            torch.ones(seq_len, seq_len, device=item_seq.device, dtype=torch.bool),
             diagonal=1
         )
         
-        # 创建 padding 掩码
+        # 创建 padding 掩码 - 使用 bool 类型
         src_key_padding_mask = ~seq_mask.bool()  # [B, L]
+        
+        # 处理全零序列，避免 NaN
+        # 如果整个序列都是 padding，至少保留第一个位置
+        all_masked = src_key_padding_mask.all(dim=1)  # [B]
+        if all_masked.any():
+            src_key_padding_mask[all_masked, 0] = False
         
         # Transformer 编码
         transformer_output = self.transformer_encoder(
@@ -809,6 +815,10 @@ class SASRec(nn.Module):
             mask=causal_mask,
             src_key_padding_mask=src_key_padding_mask
         )  # [B, L, D]
+        
+        # 检查并处理 NaN
+        if torch.isnan(transformer_output).any():
+            transformer_output = torch.nan_to_num(transformer_output, nan=0.0)
         
         # 取最后一个有效位置的输出
         seq_len_tensor = batch['seq_len']  # [B]
