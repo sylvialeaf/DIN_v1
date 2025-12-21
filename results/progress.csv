@@ -1,0 +1,2 @@
+seq_length,test_auc,test_logloss,best_valid_auc,best_epoch,status
+20,0.9294036804182529,0.34321513602493187,0.9342750307239551,6,success
