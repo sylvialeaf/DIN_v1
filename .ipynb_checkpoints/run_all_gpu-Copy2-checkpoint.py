@@ -42,7 +42,7 @@ import json
 import time
 from tqdm import tqdm
 
-from data_loader import get_rich_dataloaders, get_topk_eval_data, build_topk_batch_multi
+from data_loader import get_rich_dataloaders, get_topk_eval_data
 from models import DINRichLite, SimpleAveragePoolingRich, GRU4Rec, SASRec, NARM, AttentionLayer
 from trainer import RichTrainer, measure_inference_speed_rich
 from feature_engineering import FeatureProcessor, InteractionFeatureExtractor, prepare_lightgbm_features
@@ -290,13 +290,8 @@ class DINRichVariant(nn.Module):
         )
         
         if enhanced_mlp:
-            # 增强 MLP: 更深更宽 [512, 256, 128, 64]
             self.mlp = nn.Sequential(
-                nn.Linear(mlp_input_dim, 512),
-                nn.BatchNorm1d(512),
-                nn.PReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(512, 256),
+                nn.Linear(mlp_input_dim, 256),
                 nn.BatchNorm1d(256),
                 nn.PReLU(),
                 nn.Dropout(0.2),
@@ -305,12 +300,11 @@ class DINRichVariant(nn.Module):
                 nn.PReLU(),
                 nn.Dropout(0.2),
                 nn.Linear(128, 64),
-                nn.BatchNorm1d(64),
                 nn.PReLU(),
                 nn.Linear(64, 1)
             )
         else:
-            # 标准 MLP: [256, 128, 64]
+            # 基础 MLP 也需要 BatchNorm 和 Dropout 防止过拟合
             self.mlp = nn.Sequential(
                 nn.Linear(mlp_input_dim, 256),
                 nn.BatchNorm1d(256),
@@ -365,216 +359,55 @@ class DINRichVariant(nn.Module):
 
 
 # ========================================
-# 混合精排模块 (增强版 - 包含显式特征)
+# 混合精排模块
 # ========================================
 
-# 显式特征名称定义（用于可解释性分析）
-EXPLICIT_FEATURE_NAMES = [
-    'user_age',           # 用户年龄段
-    'user_gender',        # 用户性别
-    'user_occupation',    # 用户职业
-    'user_activity',      # 用户活跃度（历史交互数）
-    'item_year',          # 电影年代
-    'item_genre',         # 电影主类型
-    'item_genre_count',   # 电影类型数量
-    'item_popularity',    # 电影热度（被评分次数）
-    'seq_length',         # 序列长度
-    'seq_unique_items',   # 序列中独特物品数
-    'seq_avg_popularity', # 序列平均热度
-    'seq_recency',        # 序列时效性
-    'time_hour',          # 时间-小时段
-    'time_dow',           # 时间-周几
-    'time_weekend',       # 是否周末
-    'time_position',      # 时间位置（归一化）
-    'genre_match',        # 类型匹配（目标与历史）
-    'year_match',         # 年代匹配（目标与历史）
-    'hist_genre_mean',    # 历史类型均值
-    'hist_genre_std',     # 历史类型标准差
-]
-
-
 class HybridRanker:
-    """
-    DIN + LightGBM 混合精排（增强版）
+    """DIN + LightGBM 混合精排"""
     
-    特征组成:
-    - DIN 嵌入特征: 64维（用户兴趣向量）
-    - DIN 预测分数: 1维
-    - 显式特征: 20维（用户/物品/序列/时间/交叉特征）
-    
-    总计: 85维特征
-    """
-    
-    def __init__(self, din_model, device='cpu', feature_processor=None, interaction_extractor=None):
+    def __init__(self, din_model, device='cpu'):
         self.din_model = din_model
         self.device = device
         self.lgb_model = None
-        self.feature_processor = feature_processor
-        self.interaction_extractor = interaction_extractor
-        self.feature_names = None  # 用于可解释性
-        self.embedding_dim = 64
-    
-    def set_feature_extractors(self, feature_processor, interaction_extractor):
-        """设置特征处理器"""
-        self.feature_processor = feature_processor
-        self.interaction_extractor = interaction_extractor
-    
-    def _build_feature_names(self):
-        """构建完整的特征名称列表"""
-        names = []
-        # DIN 嵌入特征
-        for i in range(self.embedding_dim):
-            names.append(f'din_emb_{i}')
-        # DIN 分数
-        names.append('din_score')
-        # 显式特征
-        names.extend(EXPLICIT_FEATURE_NAMES)
-        self.feature_names = names
-        return names
-    
-    def _extract_explicit_features(self, batch):
-        """
-        从 batch 中提取显式特征（20维）
-        """
-        batch_size = batch['user_id'].shape[0]
-        features = []
-        
-        for i in range(batch_size):
-            sample = self._extract_single_sample_features(batch, i)
-            features.append(sample)
-        
-        return np.array(features)
-    
-    def _extract_single_sample_features(self, batch, idx):
-        """提取单个样本的显式特征"""
-        # 从 batch 获取基础信息
-        user_id = batch['user_id'][idx].cpu().item()
-        target_item = batch['target_item'][idx].cpu().item()
-        item_seq = batch['item_seq'][idx].cpu().numpy()
-        item_seq_mask = batch['item_seq_mask'][idx].cpu().numpy()
-        
-        # 有效序列长度
-        valid_len = int(item_seq_mask.sum())
-        history = item_seq[-valid_len:].tolist() if valid_len > 0 else []
-        
-        # 用户特征
-        user_age = batch.get('user_age', torch.zeros(1))[idx].cpu().item() if 'user_age' in batch else 0
-        user_gender = batch.get('user_gender', torch.zeros(1))[idx].cpu().item() if 'user_gender' in batch else 0
-        user_occupation = batch.get('user_occupation', torch.zeros(1))[idx].cpu().item() if 'user_occupation' in batch else 0
-        
-        # 物品特征
-        item_year = batch.get('item_year', torch.zeros(1))[idx].cpu().item() if 'item_year' in batch else 0
-        item_genre = batch.get('item_genre', torch.zeros(1))[idx].cpu().item() if 'item_genre' in batch else 0
-        
-        # 历史特征
-        history_genres = batch.get('history_genres', torch.zeros(1, 1))[idx].cpu().numpy() if 'history_genres' in batch else []
-        history_years = batch.get('history_years', torch.zeros(1, 1))[idx].cpu().numpy() if 'history_years' in batch else []
-        
-        # 过滤掉 padding (0)
-        hist_genres = [g for g in history_genres if g > 0]
-        hist_years = [y for y in history_years if y > 0]
-        
-        # 计算派生特征
-        if self.interaction_extractor is not None:
-            user_activity = self.interaction_extractor.get_user_activity(user_id)
-            item_popularity = self.interaction_extractor.get_item_popularity(target_item)
-            seq_avg_pop = np.mean([self.interaction_extractor.get_item_popularity(iid) for iid in history]) if history else 0
-        else:
-            user_activity = valid_len  # 用序列长度近似
-            item_popularity = 0
-            seq_avg_pop = 0
-        
-        if self.feature_processor is not None:
-            item_feat = self.feature_processor.get_item_features(target_item)
-            item_genre_count = item_feat.get('genre_count', 1)
-        else:
-            item_genre_count = 1
-        
-        # 构建 20 维显式特征
-        sample = [
-            # 用户特征 (4维)
-            user_age,
-            user_gender,
-            user_occupation,
-            user_activity,
-            
-            # 物品特征 (4维)
-            item_year,
-            item_genre,
-            item_genre_count,
-            item_popularity,
-            
-            # 序列特征 (4维)
-            valid_len,                                      # seq_length
-            len(set(history)) if history else 0,            # seq_unique_items
-            seq_avg_pop,                                    # seq_avg_popularity
-            0.5,                                            # seq_recency (简化)
-            
-            # 时间特征 (4维) - 简化处理
-            12,   # time_hour (默认中午)
-            3,    # time_dow (默认周三)
-            0,    # time_weekend
-            0.5,  # time_position
-            
-            # 交叉特征 (2维)
-            1 if item_genre in hist_genres else 0,          # genre_match
-            1 if item_year in hist_years else 0,            # year_match
-            
-            # 历史统计 (2维)
-            np.mean(hist_genres) if hist_genres else 0,     # hist_genre_mean
-            np.std(hist_genres) if len(hist_genres) > 1 else 0,  # hist_genre_std
-        ]
-        
-        return sample
     
     @torch.no_grad()
     def extract_din_features(self, data_loader):
-        """
-        提取完整特征: DIN嵌入 + DIN分数 + 显式特征
-        """
+        """提取 DIN 嵌入作为特征"""
         self.din_model.eval()
         self.din_model.to(self.device)
         
         all_embeddings = []
         all_scores = []
         all_labels = []
-        all_explicit = []
         
         for batch in data_loader:
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                      for k, v in batch.items()}
             
-            # 获取 DIN 嵌入
+            # 获取嵌入
             item_seq = batch['item_seq']
             seq_emb = self.din_model.item_embedding(item_seq)
             target_emb = self.din_model.item_embedding(batch['target_item'])
+            user_emb = self.din_model.user_embedding(batch['user_id'])
             
-            # 使用注意力机制获取用户兴趣向量
-            if hasattr(self.din_model, 'attention'):
-                seq_mask = batch['item_seq_mask']
-                user_interest, _ = self.din_model.attention(target_emb, seq_emb, seq_mask)
-            else:
-                seq_mask = (item_seq > 0).float()
-                user_interest = (seq_emb * seq_mask.unsqueeze(-1)).sum(dim=1) / (seq_mask.sum(dim=1, keepdim=True) + 1e-8)
+            seq_mask = (item_seq > 0).float()
+            seq_mean = (seq_emb * seq_mask.unsqueeze(-1)).sum(dim=1) / (seq_mask.sum(dim=1, keepdim=True) + 1e-8)
             
-            all_embeddings.append(user_interest.cpu().numpy())
+            # 拼接特征
+            features = torch.cat([target_emb, user_emb, seq_mean], dim=-1)
+            all_embeddings.append(features.cpu().numpy())
             
             # DIN 分数
             score = torch.sigmoid(self.din_model(batch))
             all_scores.append(score.cpu().numpy())
             all_labels.append(batch['label'].cpu().numpy())
-            
-            # 显式特征
-            explicit_features = self._extract_explicit_features(batch)
-            all_explicit.append(explicit_features)
         
         embeddings = np.concatenate(all_embeddings, axis=0)
         scores = np.concatenate(all_scores, axis=0)
         labels = np.concatenate(all_labels, axis=0)
-        explicit = np.concatenate(all_explicit, axis=0)
         
-        # 拼接所有特征: [DIN嵌入, DIN分数, 显式特征]
-        features = np.column_stack([embeddings, scores, explicit])
+        # 拼接 DIN 分数作为特征
+        features = np.column_stack([embeddings, scores])
         return features, labels
     
     def train_lgb(self, train_loader, valid_loader):
@@ -584,9 +417,6 @@ class HybridRanker:
         
         X_train, y_train = self.extract_din_features(train_loader)
         X_valid, y_valid = self.extract_din_features(valid_loader)
-        
-        # 构建特征名称
-        self._build_feature_names()
         
         params = {
             'objective': 'binary',
@@ -599,7 +429,7 @@ class HybridRanker:
             'random_state': 2020
         }
         
-        train_data = lgb.Dataset(X_train, label=y_train, feature_name=self.feature_names)
+        train_data = lgb.Dataset(X_train, label=y_train)
         valid_data = lgb.Dataset(X_valid, label=y_valid)
         
         self.lgb_model = lgb.train(
@@ -622,88 +452,6 @@ class HybridRanker:
         logloss = log_loss(y_test, y_pred)
         
         return {'auc': auc, 'logloss': logloss}
-    
-    def get_feature_importance(self, importance_type='gain', top_k=20):
-        """
-        获取特征重要性（用于可解释性分析）
-        
-        Args:
-            importance_type: 'gain' 或 'split'
-            top_k: 返回前 K 个重要特征
-        
-        Returns:
-            dict: 特征名 -> 重要性值
-        """
-        if self.lgb_model is None:
-            return {}
-        
-        importance = self.lgb_model.feature_importance(importance_type=importance_type)
-        
-        if self.feature_names is None:
-            self._build_feature_names()
-        
-        # 排序并返回 Top-K
-        sorted_indices = np.argsort(importance)[::-1][:top_k]
-        result = {}
-        for idx in sorted_indices:
-            if idx < len(self.feature_names):
-                result[self.feature_names[idx]] = float(importance[idx])
-        
-        return result
-
-
-# ========================================
-# 辅助函数：构建单样本 batch
-# ========================================
-
-def _build_single_batch(user_id, item_id, history, feature_processor, interaction_extractor, max_seq_length, device):
-    """
-    为单个 (user, item) 对构建模型输入 batch
-    
-    用于 Hybrid Top-K 评估
-    """
-    # 用户特征
-    user_feat = feature_processor.get_user_features(user_id)
-    
-    # 物品特征
-    item_feat = feature_processor.get_item_features(item_id)
-    
-    # 历史序列
-    hist = history[-max_seq_length:] if len(history) > max_seq_length else history
-    seq_len = len(hist)
-    
-    # Padding
-    padded_seq = [0] * (max_seq_length - seq_len) + hist
-    mask = [0] * (max_seq_length - seq_len) + [1] * seq_len
-    
-    # 历史物品特征
-    history_genres = []
-    history_years = []
-    for iid in padded_seq:
-        if iid > 0:
-            ifeat = feature_processor.get_item_features(iid)
-            history_genres.append(ifeat.get('primary_genre', 0))
-            history_years.append(ifeat.get('year_bucket', 0))
-        else:
-            history_genres.append(0)
-            history_years.append(0)
-    
-    # 构建 batch (batch_size=1)
-    batch = {
-        'user_id': torch.tensor([user_id], dtype=torch.long, device=device),
-        'target_item': torch.tensor([item_id], dtype=torch.long, device=device),
-        'item_seq': torch.tensor([padded_seq], dtype=torch.long, device=device),
-        'item_seq_mask': torch.tensor([mask], dtype=torch.float, device=device),
-        'history_genres': torch.tensor([history_genres], dtype=torch.long, device=device),
-        'history_years': torch.tensor([history_years], dtype=torch.long, device=device),
-        'item_genre': torch.tensor([item_feat.get('primary_genre', 0)], dtype=torch.long, device=device),
-        'item_year': torch.tensor([item_feat.get('year_bucket', 0)], dtype=torch.long, device=device),
-        'user_age': torch.tensor([user_feat.get('age_bucket', 0)], dtype=torch.long, device=device),
-        'user_gender': torch.tensor([user_feat.get('gender', 0)], dtype=torch.long, device=device),
-        'user_occupation': torch.tensor([user_feat.get('occupation', 0)], dtype=torch.long, device=device),
-    }
-    
-    return batch
 
 
 # ========================================
@@ -893,21 +641,6 @@ def run_experiment2(dataset_name):
     din_train_time = 0  # 保存 DIN 训练时间，用于混合精排公平对比
     din_num_params = 0  # 保存 DIN 参数量
     
-    # 提前创建 interaction_extractor（用于 Hybrid 显式特征）
-    data_path = os.path.join('./data', dataset_name)
-    if dataset_name == 'ml-100k':
-        interactions = pd.read_csv(
-            os.path.join(data_path, 'u.data'),
-            sep='\t', names=['user_id', 'item_id', 'rating', 'timestamp']
-        )
-    else:
-        interactions = pd.read_csv(
-            os.path.join(data_path, 'ratings.dat'),
-            sep='::', names=['user_id', 'item_id', 'rating', 'timestamp'],
-            engine='python'
-        )
-    interaction_extractor = InteractionFeatureExtractor(interactions)
-    
     # 测试各深度模型
     for model_name in MODELS_TO_TEST:
         print(f"  🚀 {model_name}...", end=" ", flush=True)
@@ -965,12 +698,6 @@ def run_experiment2(dataset_name):
             )
             train_time = time.time() - t1
             
-            # 保存 DIN 模型和训练时间（用于混合精排）
-            if model_name == 'DIN':
-                din_model = trainer.raw_model
-                din_train_time = train_time
-                din_num_params = sum(p.numel() for p in trainer.raw_model.parameters())
-            
             # CTR 指标
             test_metrics = trainer.evaluate(test_loader)
             speed = measure_inference_speed_rich(trainer.raw_model, test_loader, DEVICE)
@@ -1021,7 +748,20 @@ def run_experiment2(dataset_name):
             from sklearn.metrics import roc_auc_score, log_loss
             from sklearn.model_selection import train_test_split
             
-            # 复用之前创建的 interactions 和 interaction_extractor
+            data_path = os.path.join('./data', dataset_name)
+            if dataset_name == 'ml-100k':
+                interactions = pd.read_csv(
+                    os.path.join(data_path, 'u.data'),
+                    sep='\t', names=['user_id', 'item_id', 'rating', 'timestamp']
+                )
+            else:
+                interactions = pd.read_csv(
+                    os.path.join(data_path, 'ratings.dat'),
+                    sep='::', names=['user_id', 'item_id', 'rating', 'timestamp'],
+                    engine='python'
+                )
+            
+            interaction_extractor = InteractionFeatureExtractor(interactions)
             X, y, feature_names = prepare_lightgbm_features(
                 interactions, fp, interaction_extractor, max_seq_length=seq_length
             )
@@ -1048,40 +788,22 @@ def run_experiment2(dataset_name):
             
             y_pred = lgb_model.predict(X_test)
             test_auc = roc_auc_score(y_test, y_pred)
-            test_logloss = log_loss(y_test, y_pred)
             
-            # LightGBM 参数量估算（叶子数 × 树的数量）
+            # LightGBM 参数量估算（叶子数 × 树的数量 × 特征数）
             lgb_num_trees = lgb_model.num_trees()
             lgb_num_leaves = params['num_leaves']
-            lgb_num_params = lgb_num_trees * lgb_num_leaves
+            lgb_num_params = lgb_num_trees * lgb_num_leaves  # 近似参数量
             
-            result_entry = {
+            results.append({
                 'experiment': 'exp2_method_compare',
                 'dataset': dataset_name,
                 'model': 'LightGBM',
                 'test_auc': test_auc,
-                'test_logloss': test_logloss,
                 'train_time_sec': train_time,
                 'num_params': lgb_num_params,
                 'status': 'success'
-            }
-            
-            # LightGBM Top-K 评估（与其他模型对齐）
-            if ENABLE_TOPK and eval_data is not None:
-                from hybrid_ranker import LightGBMRanker
-                lgb_ranker = LightGBMRanker(lgb_model, fp_eval, interaction_extractor)
-                topk_metrics = lgb_ranker.evaluate_topk(
-                    eval_data=eval_data,
-                    max_seq_length=seq_length,
-                    ks=TOPK_VALUES,
-                    show_progress=False
-                )
-                result_entry.update(topk_metrics)
-                print(f"AUC={test_auc:.4f}, HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
-            else:
-                print(f"AUC={test_auc:.4f}, params={lgb_num_params}")
-            
-            results.append(result_entry)
+            })
+            print(f"AUC={test_auc:.4f}, params={lgb_num_params}")
             
         except Exception as e:
             print(f"❌ {str(e)[:50]}")
@@ -1097,122 +819,21 @@ def run_experiment2(dataset_name):
     if HAS_LIGHTGBM and din_model is not None:
         print("  🚀 Hybrid (DIN + LightGBM)...", end=" ", flush=True)
         try:
-            # 创建 Hybrid 并传入特征处理器（用于显式特征）
-            hybrid = HybridRanker(
-                din_model, 
-                device=DEVICE,
-                feature_processor=fp,
-                interaction_extractor=interaction_extractor
-            )
+            hybrid = HybridRanker(din_model, device=DEVICE)
             t1 = time.time()
             hybrid.train_lgb(train_loader, valid_loader)
             lgb_train_time = time.time() - t1
-
+            
             # 公平对比：总训练时间 = DIN训练时间 + LightGBM训练时间
             total_train_time = din_train_time + lgb_train_time
-
+            
             test_metrics = hybrid.evaluate(test_loader)
-
-            # Top-K 指标（与其他模型对齐）
-            topk_metrics = {}
-            if ENABLE_TOPK and eval_data is not None:
-                # 使用简化的 Hybrid Top-K 评估
-                from tqdm import tqdm
-                all_hr = {k: [] for k in TOPK_VALUES}
-                all_ndcg = {k: [] for k in TOPK_VALUES}
-                all_mrr = {k: [] for k in TOPK_VALUES}
-                
-                din_model.eval()
-                din_model.to(DEVICE)
-                
-                for entry in tqdm(eval_data, desc="Hybrid Top-K"):
-                    user_id = entry['user_id']
-                    history = entry['history'][-seq_length:]
-                    candidates = entry['candidates']
-                    ground_truth = entry['ground_truth']
-                    
-                    # 为每个候选物品构建 batch 并预测
-                    scores = []
-                    for item_id in candidates:
-                        # 构建单样本输入
-                        batch = _build_single_batch(
-                            user_id, item_id, history, 
-                            fp_eval, ie_eval, seq_length, DEVICE
-                        )
-                        
-                        with torch.no_grad():
-                            # 使用与训练一致的特征提取方式（85维）
-                            # 1. DIN 用户兴趣向量 (64维)
-                            item_seq = batch['item_seq']
-                            seq_emb = din_model.item_embedding(item_seq)
-                            target_emb = din_model.item_embedding(batch['target_item'])
-                            
-                            if hasattr(din_model, 'attention'):
-                                seq_mask = batch['item_seq_mask']
-                                user_interest, _ = din_model.attention(target_emb, seq_emb, seq_mask)
-                            else:
-                                seq_mask = (item_seq > 0).float()
-                                user_interest = (seq_emb * seq_mask.unsqueeze(-1)).sum(dim=1) / (seq_mask.sum(dim=1, keepdim=True) + 1e-8)
-                            
-                            # 2. DIN 分数 (1维)
-                            din_score = torch.sigmoid(din_model(batch)).cpu().numpy()
-                            
-                            # 3. 显式特征 (20维) - 使用 HybridRanker 的方法
-                            explicit_features = hybrid._extract_explicit_features(batch)
-                            
-                            # 拼接为 LightGBM 输入: [DIN嵌入, DIN分数, 显式特征] = 85维
-                            lgb_input = np.column_stack([
-                                user_interest.cpu().numpy(),  # 64维
-                                din_score,                     # 1维
-                                explicit_features              # 20维
-                            ])
-                            score = hybrid.lgb_model.predict(lgb_input)[0]
-                            scores.append(score)
-                    
-                    # 排序并计算指标
-                    sorted_indices = np.argsort(-np.array(scores))
-                    ranked_items = [candidates[i] for i in sorted_indices]
-                    
-                    for k in TOPK_VALUES:
-                        # HR@K
-                        hit = 1 if ground_truth in ranked_items[:k] else 0
-                        all_hr[k].append(hit)
-                        
-                        # NDCG@K
-                        if ground_truth in ranked_items[:k]:
-                            rank = ranked_items[:k].index(ground_truth) + 1
-                            all_ndcg[k].append(1.0 / np.log2(rank + 1))
-                            all_mrr[k].append(1.0 / rank)
-                        else:
-                            all_ndcg[k].append(0.0)
-                            all_mrr[k].append(0.0)
-                
-                # 计算平均值
-                for k in TOPK_VALUES:
-                    hr_k = np.mean(all_hr[k])
-                    topk_metrics[f'HR@{k}'] = hr_k
-                    topk_metrics[f'Recall@{k}'] = hr_k  # 单 ground truth 时 Recall = HR
-                    topk_metrics[f'NDCG@{k}'] = np.mean(all_ndcg[k])
-                    topk_metrics[f'MRR@{k}'] = np.mean(all_mrr[k])
-                    topk_metrics[f'Precision@{k}'] = hr_k / k
-                
-                print(f"AUC={test_metrics['auc']:.4f}, HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}, total_time={total_train_time:.2f}s (DIN:{din_train_time:.2f}s + LGB:{lgb_train_time:.2f}s)")
-            else:
-                print(f"AUC={test_metrics['auc']:.4f}, total_time={total_train_time:.2f}s (DIN:{din_train_time:.2f}s + LGB:{lgb_train_time:.2f}s)")
-
+            
             # Hybrid 参数量 = DIN参数量 + LightGBM参数量（估算）
             lgb_num_params_hybrid = hybrid.lgb_model.num_trees() * 31 if hybrid.lgb_model else 0
             total_num_params = din_num_params + lgb_num_params_hybrid
             
-            # 🔍 获取特征重要性（可解释性分析）- 使用新的方法
-            feature_importance = hybrid.get_feature_importance(importance_type='gain', top_k=20)
-            
-            if feature_importance:
-                print(f"  📊 特征重要性 Top 10 (包含显式特征):")
-                for i, (name, imp) in enumerate(list(feature_importance.items())[:10], 1):
-                    print(f"     {i}. {name}: {imp:.2f}")
-
-            result_entry = {
+            results.append({
                 'experiment': 'exp2_hybrid',
                 'dataset': dataset_name,
                 'model': 'DIN+LightGBM',
@@ -1224,13 +845,10 @@ def run_experiment2(dataset_name):
                 'num_params': total_num_params,
                 'din_num_params': din_num_params,
                 'lgb_num_params': lgb_num_params_hybrid,
-                'feature_importance_top20': feature_importance,  # 🆕 保存显式特征重要性
-                'feature_names': EXPLICIT_FEATURE_NAMES,  # 🆕 保存特征名称列表
                 'status': 'success'
-            }
-            result_entry.update(topk_metrics)
-            results.append(result_entry)
-
+            })
+            print(f"AUC={test_metrics['auc']:.4f}, total_time={total_train_time:.2f}s (DIN:{din_train_time:.2f}s + LGB:{lgb_train_time:.2f}s)")
+            
         except Exception as e:
             print(f"❌ {str(e)[:50]}")
             results.append({
@@ -1240,7 +858,7 @@ def run_experiment2(dataset_name):
                 'test_auc': None,
                 'status': f'error: {str(e)[:100]}'
             })
-
+    
     return results
 
 

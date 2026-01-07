@@ -1,27 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-实验三（增强版）：DIN 改进消融实验
+实验三：DIN 改进消融实验
 
 在丰富特征基础上，测试不同改进策略的效果。
 
-消融变体：
-1. DIN-Rich-Base: 基础丰富特征 DIN
-2. DIN-Rich-TimeDec: + 时间衰减注意力
-3. DIN-Rich-MultiHead: + 多头注意力
-4. DIN-Rich-Full: 完整改进
-5. DIN-Rich-Full-v2: 完整改进 + 增强 MLP
+消融变体（与README对齐）：
+1. DIN-Base: 基础DIN（无改进）
+2. DIN-TimeDec: + 时间衰减注意力
+3. DIN-MultiHead: + 多头注意力
+4. DIN-Enhanced: + 增强MLP（更深的网络）
+5. DIN-Full: 时间衰减 + 增强MLP（最佳组合）
 
-特征工程：
-- 用户画像特征
-- 物品属性特征
-- 历史序列特征
-- 时间上下文特征
+评估指标：
+- CTR: AUC, LogLoss
+- Top-K: HR@K, NDCG@K, MRR@K（与实验1/2统一）
 
 输出:
-- results/experiment3_rich_results.csv
-- results/experiment3_rich_plot.png
-- results/experiment3_rich_report.json
+- results/experiment3_results.csv
+- results/experiment3_plot.png
+- results/experiment3_report.json
 """
 
 import os
@@ -38,9 +36,9 @@ from datetime import datetime
 import json
 import time
 
-from data_loader import get_rich_dataloaders
+from data_loader import get_rich_dataloaders, get_topk_eval_data
 from trainer import RichTrainer, measure_inference_speed_rich
-from models import AttentionLayer
+from feature_engineering import InteractionFeatureExtractor
 
 
 # ========================================
@@ -154,67 +152,6 @@ class MultiHeadRichAttention(nn.Module):
         return output, None
 
 
-class TimeDecayMultiHeadRichAttention(nn.Module):
-    """
-    时间衰减 + 多头注意力（完整改进）
-    """
-    
-    def __init__(self, input_dim, num_heads=4, hidden_dims=[64, 32], time_decay=0.1):
-        super(TimeDecayMultiHeadRichAttention, self).__init__()
-        
-        self.num_heads = num_heads
-        self.time_decay = time_decay
-        
-        self.attention_heads = nn.ModuleList([
-            self._build_attention_mlp(4 * input_dim, hidden_dims)
-            for _ in range(num_heads)
-        ])
-        
-        self.output_proj = nn.Linear(input_dim, input_dim)
-    
-    def _build_attention_mlp(self, input_dim, hidden_dims):
-        layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.PReLU())
-            prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, 1))
-        return nn.Sequential(*layers)
-    
-    def forward(self, query, keys, keys_mask=None):
-        batch_size, seq_len, dim = keys.shape
-        
-        query_expanded = query.unsqueeze(1).expand(-1, seq_len, -1)
-        
-        attention_input = torch.cat([
-            keys, query_expanded,
-            keys * query_expanded,
-            keys - query_expanded
-        ], dim=-1)
-        
-        # 时间衰减权重
-        positions = torch.arange(seq_len, device=keys.device).float()
-        time_weights = torch.exp(self.time_decay * (positions - seq_len + 1))
-        
-        head_outputs = []
-        for head in self.attention_heads:
-            scores = head(attention_input).squeeze(-1)
-            scores = scores * time_weights.unsqueeze(0)
-            
-            if keys_mask is not None:
-                scores = scores.masked_fill(~keys_mask.bool(), -1e9)
-            
-            weights = F.softmax(scores, dim=-1)
-            output = torch.sum(weights.unsqueeze(-1) * keys, dim=1)
-            head_outputs.append(output)
-        
-        combined = torch.stack(head_outputs, dim=1).mean(dim=1)
-        output = self.output_proj(combined)
-        
-        return output, None
-
-
 # ========================================
 # 改进版 DIN 模型
 # ========================================
@@ -223,7 +160,14 @@ class DINRichImproved(nn.Module):
     """
     改进版丰富特征 DIN
     
-    支持不同的注意力机制变体。
+    支持不同的注意力机制变体和MLP配置。
+    
+    变体说明：
+    - base: 基础注意力 + 标准MLP
+    - time_decay: 时间衰减注意力 + 标准MLP
+    - multi_head: 多头注意力 + 标准MLP
+    - enhanced: 基础注意力 + 增强MLP（更深更宽）
+    - full: 时间衰减注意力 + 增强MLP（最佳组合）
     """
     
     def __init__(
@@ -233,7 +177,8 @@ class DINRichImproved(nn.Module):
         feature_dims,
         embedding_dim=64,
         feature_embedding_dim=16,
-        attention_type='base',  # 'base', 'time_decay', 'multi_head', 'full'
+        attention_type='base',  # 'base', 'time_decay', 'multi_head'
+        use_enhanced_mlp=False,  # 是否使用增强MLP
         mlp_hidden_dims=[256, 128, 64],
         dropout_rate=0.2,
         num_heads=4,
@@ -244,6 +189,7 @@ class DINRichImproved(nn.Module):
         self.embedding_dim = embedding_dim
         self.feature_embedding_dim = feature_embedding_dim
         self.attention_type = attention_type
+        self.use_enhanced_mlp = use_enhanced_mlp
         
         # 嵌入层
         self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
@@ -265,12 +211,10 @@ class DINRichImproved(nn.Module):
             self.attention = TimeDecayRichAttention(self.seq_feature_dim, [64, 32], time_decay)
         elif attention_type == 'multi_head':
             self.attention = MultiHeadRichAttention(self.seq_feature_dim, num_heads, [64, 32])
-        elif attention_type == 'full':
-            self.attention = TimeDecayMultiHeadRichAttention(self.seq_feature_dim, num_heads, [64, 32], time_decay)
         else:
             raise ValueError(f"Unknown attention type: {attention_type}")
         
-        # MLP
+        # MLP输入维度
         mlp_input_dim = (
             self.seq_feature_dim +  # 用户兴趣
             self.seq_feature_dim +  # 目标物品
@@ -278,19 +222,56 @@ class DINRichImproved(nn.Module):
             feature_embedding_dim * 3  # 年龄 + 性别 + 职业
         )
         
-        mlp_layers = []
-        prev_dim = mlp_input_dim
-        for hidden_dim in mlp_hidden_dims:
-            mlp_layers.append(nn.Linear(prev_dim, hidden_dim))
-            mlp_layers.append(nn.BatchNorm1d(hidden_dim))
-            mlp_layers.append(nn.PReLU())
-            mlp_layers.append(nn.Dropout(dropout_rate))
-            prev_dim = hidden_dim
-        mlp_layers.append(nn.Linear(prev_dim, 1))
-        
-        self.mlp = nn.Sequential(*mlp_layers)
+        # 选择MLP配置
+        if use_enhanced_mlp:
+            # 增强MLP：更深更宽，带残差连接
+            self.mlp = self._build_enhanced_mlp(mlp_input_dim, dropout_rate)
+        else:
+            # 标准MLP
+            self.mlp = self._build_standard_mlp(mlp_input_dim, mlp_hidden_dims, dropout_rate)
         
         self._init_weights()
+    
+    def _build_standard_mlp(self, input_dim, hidden_dims, dropout_rate):
+        """标准MLP"""
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.PReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))
+        return nn.Sequential(*layers)
+    
+    def _build_enhanced_mlp(self, input_dim, dropout_rate):
+        """增强MLP：更深更宽，带残差风格的跳跃连接"""
+        # 增强配置：[512, 256, 128, 64]，比标准版更深
+        hidden_dims = [512, 256, 128, 64]
+        
+        layers = []
+        prev_dim = input_dim
+        
+        # 第一层：投影到512
+        layers.append(nn.Linear(prev_dim, hidden_dims[0]))
+        layers.append(nn.BatchNorm1d(hidden_dims[0]))
+        layers.append(nn.PReLU())
+        layers.append(nn.Dropout(dropout_rate))
+        prev_dim = hidden_dims[0]
+        
+        # 后续层
+        for hidden_dim in hidden_dims[1:]:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.PReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        
+        # 输出层
+        layers.append(nn.Linear(prev_dim, 1))
+        
+        return nn.Sequential(*layers)
     
     def _init_weights(self):
         for module in self.modules():
@@ -337,7 +318,7 @@ class DINRichImproved(nn.Module):
 # ========================================
 
 print("=" * 80)
-print("实验三（增强版）：DIN 改进消融实验")
+print("实验三：DIN 改进消融实验")
 print("=" * 80)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -349,12 +330,38 @@ EPOCHS = 20
 BATCH_SIZE = 256
 EMBEDDING_DIM = 64
 
-# 消融配置
+# 消融配置（与README对齐：5个变体）
 ABLATION_CONFIGS = [
-    {'name': 'DIN-Rich-Base', 'attention_type': 'base', 'description': '丰富特征 + 基础注意力'},
-    {'name': 'DIN-Rich-TimeDec', 'attention_type': 'time_decay', 'description': '+ 时间衰减注意力'},
-    {'name': 'DIN-Rich-MultiHead', 'attention_type': 'multi_head', 'description': '+ 多头注意力'},
-    {'name': 'DIN-Rich-Full', 'attention_type': 'full', 'description': '时间衰减 + 多头注意力'},
+    {
+        'name': 'DIN-Base', 
+        'attention_type': 'base', 
+        'use_enhanced_mlp': False,
+        'description': '基础DIN（无改进）'
+    },
+    {
+        'name': 'DIN-TimeDec', 
+        'attention_type': 'time_decay', 
+        'use_enhanced_mlp': False,
+        'description': '+ 时间衰减注意力'
+    },
+    {
+        'name': 'DIN-MultiHead', 
+        'attention_type': 'multi_head', 
+        'use_enhanced_mlp': False,
+        'description': '+ 多头注意力'
+    },
+    {
+        'name': 'DIN-Enhanced', 
+        'attention_type': 'base', 
+        'use_enhanced_mlp': True,
+        'description': '+ 增强MLP（更深网络）'
+    },
+    {
+        'name': 'DIN-Full', 
+        'attention_type': 'time_decay', 
+        'use_enhanced_mlp': True,
+        'description': '时间衰减 + 增强MLP（最佳组合）'
+    },
 ]
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
@@ -376,6 +383,13 @@ train_loader, valid_loader, test_loader, dataset_info, fp = get_rich_dataloaders
     batch_size=BATCH_SIZE
 )
 
+# Top-K 评估数据（与实验1/2统一）
+eval_data, eval_info, fp_topk, interaction_extractor = get_topk_eval_data(
+    data_dir='./data',
+    dataset_name='ml-100k',
+    max_seq_length=MAX_SEQ_LENGTH
+)
+
 for config in ABLATION_CONFIGS:
     print("\n" + "=" * 80)
     print(f"🚀 {config['name']}: {config['description']}")
@@ -388,6 +402,7 @@ for config in ABLATION_CONFIGS:
             feature_dims=dataset_info['feature_dims'],
             embedding_dim=EMBEDDING_DIM,
             attention_type=config['attention_type'],
+            use_enhanced_mlp=config['use_enhanced_mlp'],
             mlp_hidden_dims=[256, 128, 64],
             dropout_rate=0.2
         )
@@ -404,10 +419,21 @@ for config in ABLATION_CONFIGS:
         )
         train_time = time.time() - t1
         
+        # CTR 评估
         test_metrics = trainer.evaluate(test_loader)
         speed = measure_inference_speed_rich(model, test_loader, DEVICE)
         
-        results.append({
+        # Top-K 评估（与实验1/2统一）
+        topk_metrics = trainer.evaluate_topk(
+            eval_data=eval_data,
+            feature_processor=fp_topk,
+            interaction_extractor=interaction_extractor,
+            max_seq_length=MAX_SEQ_LENGTH,
+            ks=[5, 10, 20],
+            show_progress=False
+        )
+        
+        result_entry = {
             'variant': config['name'],
             'description': config['description'],
             'test_auc': test_metrics['auc'],
@@ -415,12 +441,16 @@ for config in ABLATION_CONFIGS:
             'best_valid_auc': train_result['best_valid_auc'],
             'train_time_sec': train_time,
             'qps': speed['qps'],
+            'num_params': sum(p.numel() for p in model.parameters()),
             'status': 'success'
-        })
+        }
+        result_entry.update(topk_metrics)
+        results.append(result_entry)
         
         print(f"\n✅ {config['name']} 完成!")
         print(f"   Test AUC: {test_metrics['auc']:.4f}")
         print(f"   Test LogLoss: {test_metrics['logloss']:.4f}")
+        print(f"   HR@10: {topk_metrics['HR@10']:.4f}, NDCG@10: {topk_metrics['NDCG@10']:.4f}")
         print(f"   QPS: {speed['qps']:.0f}")
         
     except Exception as e:
@@ -445,7 +475,7 @@ total_time = (end_time - start_time).total_seconds()
 
 # 保存结果
 df_results = pd.DataFrame(results)
-results_file = os.path.join(RESULTS_DIR, 'experiment3_rich_results.csv')
+results_file = os.path.join(RESULTS_DIR, 'experiment3_results.csv')
 df_results.to_csv(results_file, index=False)
 
 print("\n" + "=" * 80)
@@ -457,68 +487,91 @@ print("\n📊 生成可视化...")
 df_success = df_results[df_results['status'] == 'success'].copy()
 
 if len(df_success) > 0:
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#DDA0DD']
     
     # AUC 对比
-    bars = axes[0].bar(
+    bars = axes[0, 0].bar(
         range(len(df_success)), 
         df_success['test_auc'],
         color=colors[:len(df_success)]
     )
-    axes[0].set_xticks(range(len(df_success)))
-    axes[0].set_xticklabels(df_success['variant'], rotation=20, ha='right')
-    axes[0].set_ylabel('Test AUC', fontsize=12)
-    axes[0].set_title('消融实验: AUC 对比', fontsize=14, fontweight='bold')
+    axes[0, 0].set_xticks(range(len(df_success)))
+    axes[0, 0].set_xticklabels(df_success['variant'], rotation=20, ha='right')
+    axes[0, 0].set_ylabel('Test AUC', fontsize=12)
+    axes[0, 0].set_title('消融实验: AUC 对比', fontsize=14, fontweight='bold')
     for bar, val in zip(bars, df_success['test_auc']):
-        axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+        axes[0, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
                     f'{val:.4f}', ha='center', va='bottom', fontsize=9)
     
-    # 改进幅度
-    base_auc = df_success[df_success['variant'] == 'DIN-Rich-Base']['test_auc'].values[0]
-    improvements = [(auc - base_auc) / base_auc * 100 for auc in df_success['test_auc']]
+    # 改进幅度（相对Base）
+    base_auc = df_success[df_success['variant'] == 'DIN-Base']['test_auc'].values[0]
+    improvements = [(auc - base_auc) * 100 for auc in df_success['test_auc']]  # 绝对提升 × 100
     
-    bars = axes[1].bar(
+    bars = axes[0, 1].bar(
         range(len(df_success)), 
         improvements,
         color=colors[:len(df_success)]
     )
-    axes[1].set_xticks(range(len(df_success)))
-    axes[1].set_xticklabels(df_success['variant'], rotation=20, ha='right')
-    axes[1].set_ylabel('相对基线提升 (%)', fontsize=12)
-    axes[1].set_title('消融实验: 改进幅度', fontsize=14, fontweight='bold')
-    axes[1].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    axes[0, 1].set_xticks(range(len(df_success)))
+    axes[0, 1].set_xticklabels(df_success['variant'], rotation=20, ha='right')
+    axes[0, 1].set_ylabel('相对基线 AUC 提升 (×100)', fontsize=12)
+    axes[0, 1].set_title('消融实验: 改进幅度 (ΔAUC)', fontsize=14, fontweight='bold')
+    axes[0, 1].axhline(y=0, color='gray', linestyle='--', alpha=0.5)
     for bar, val in zip(bars, improvements):
-        axes[1].text(bar.get_x() + bar.get_width()/2,
+        axes[0, 1].text(bar.get_x() + bar.get_width()/2,
                     bar.get_height() + 0.1 if val >= 0 else bar.get_height() - 0.3,
-                    f'{val:.2f}%', ha='center', va='bottom', fontsize=9)
+                    f'{val/100:+.4f}', ha='center', va='bottom', fontsize=9)
+    
+    # NDCG@10 对比（Top-K指标）
+    if 'NDCG@10' in df_success.columns:
+        bars = axes[1, 0].bar(
+            range(len(df_success)), 
+            df_success['NDCG@10'],
+            color=colors[:len(df_success)]
+        )
+        axes[1, 0].set_xticks(range(len(df_success)))
+        axes[1, 0].set_xticklabels(df_success['variant'], rotation=20, ha='right')
+        axes[1, 0].set_ylabel('NDCG@10', fontsize=12)
+        axes[1, 0].set_title('消融实验: Top-K 推荐质量', fontsize=14, fontweight='bold')
+        for bar, val in zip(bars, df_success['NDCG@10']):
+            axes[1, 0].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005,
+                        f'{val:.4f}', ha='center', va='bottom', fontsize=9)
     
     # QPS 对比
-    bars = axes[2].bar(
+    bars = axes[1, 1].bar(
         range(len(df_success)), 
         df_success['qps'],
         color=colors[:len(df_success)]
     )
-    axes[2].set_xticks(range(len(df_success)))
-    axes[2].set_xticklabels(df_success['variant'], rotation=20, ha='right')
-    axes[2].set_ylabel('QPS', fontsize=12)
-    axes[2].set_title('消融实验: 推理速度', fontsize=14, fontweight='bold')
+    axes[1, 1].set_xticks(range(len(df_success)))
+    axes[1, 1].set_xticklabels(df_success['variant'], rotation=20, ha='right')
+    axes[1, 1].set_ylabel('QPS', fontsize=12)
+    axes[1, 1].set_title('消融实验: 推理速度', fontsize=14, fontweight='bold')
     for bar, val in zip(bars, df_success['qps']):
-        axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
+        axes[1, 1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
                     f'{val:.0f}', ha='center', va='bottom', fontsize=9)
     
     plt.tight_layout()
-    plot_file = os.path.join(RESULTS_DIR, 'experiment3_rich_plot.png')
+    plot_file = os.path.join(RESULTS_DIR, 'experiment3_plot.png')
     plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     print(f"✅ 图表已保存: {plot_file}")
     plt.close()
 
 # 报告
 report = {
-    'experiment': 'Experiment 3 (Rich Features): DIN Improvement Ablation Study',
+    'experiment': 'Experiment 3: DIN Improvement Ablation Study',
     'dataset': 'ml-100k',
-    'ablation_configs': [c['name'] for c in ABLATION_CONFIGS],
+    'ablation_configs': [
+        {'name': c['name'], 'description': c['description']} 
+        for c in ABLATION_CONFIGS
+    ],
+    'ablation_factors': {
+        'time_decay_attention': '时间衰减注意力：近期行为权重更高',
+        'multi_head_attention': '多头注意力：捕获多维兴趣',
+        'enhanced_mlp': '增强MLP：更深网络 [512, 256, 128, 64]'
+    },
     'features_used': [
         'item_id', 'user_id',
         'history_genres', 'history_years',
@@ -534,9 +587,12 @@ if len(df_success) > 0:
     report['best_variant'] = df_success.loc[best_idx, 'variant']
     report['best_auc'] = float(df_success.loc[best_idx, 'test_auc'])
     report['baseline_auc'] = float(base_auc)
-    report['max_improvement'] = float(max(improvements))
+    report['improvements'] = {
+        row['variant']: float(row['test_auc'] - base_auc)
+        for _, row in df_success.iterrows()
+    }
 
-report_file = os.path.join(RESULTS_DIR, 'experiment3_rich_report.json')
+report_file = os.path.join(RESULTS_DIR, 'experiment3_report.json')
 with open(report_file, 'w', encoding='utf-8') as f:
     json.dump(report, f, indent=2, ensure_ascii=False)
 
@@ -544,16 +600,28 @@ with open(report_file, 'w', encoding='utf-8') as f:
 print("\n" + "=" * 80)
 print("📋 实验结果摘要")
 print("=" * 80)
-print(df_results[['variant', 'test_auc', 'test_logloss', 'qps']].to_string(index=False))
+
+# CTR 指标
+print("\n📊 CTR 指标:")
+print(df_results[['variant', 'test_auc', 'test_logloss', 'qps', 'num_params']].to_string(index=False))
+
+# Top-K 指标
+if 'HR@10' in df_results.columns:
+    print("\n📊 Top-K 推荐指标:")
+    topk_cols = ['variant', 'HR@10', 'NDCG@10', 'MRR@10']
+    print(df_results[topk_cols].to_string(index=False))
 
 if len(df_success) > 0:
     print("\n🔍 关键发现:")
     print(f"   基线 AUC: {base_auc:.4f}")
     print(f"   最佳变体: {report.get('best_variant', 'N/A')} (AUC={report.get('best_auc', 0):.4f})")
-    print(f"   最大提升: {report.get('max_improvement', 0):.2f}%")
     
     for _, row in df_success.iterrows():
-        improvement = (row['test_auc'] - base_auc) / base_auc * 100
-        print(f"   {row['variant']}: AUC={row['test_auc']:.4f} ({improvement:+.2f}%)")
+        delta = row['test_auc'] - base_auc
+        print(f"   {row['variant']}: AUC={row['test_auc']:.4f} (ΔAUC={delta:+.4f})")
 
+print(f"\n📁 结果文件:")
+print(f"   - {results_file}")
+print(f"   - {os.path.join(RESULTS_DIR, 'experiment3_plot.png')}")
+print(f"   - {report_file}")
 print("=" * 80)

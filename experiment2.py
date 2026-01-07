@@ -40,13 +40,13 @@ import time
 from sklearn.metrics import roc_auc_score, log_loss
 from sklearn.model_selection import train_test_split
 
-from data_loader import get_rich_dataloaders
+from data_loader import get_rich_dataloaders, get_topk_eval_data
 from models import DINRichLite, SimpleAveragePoolingRich, GRU4Rec
 from trainer import RichTrainer, measure_inference_speed_rich
 from feature_engineering import FeatureProcessor, InteractionFeatureExtractor, prepare_lightgbm_features
 
 try:
-    from hybrid_ranker import HybridRanker
+    from hybrid_ranker import HybridRanker, LightGBMRanker
     HAS_HYBRID = True
 except ImportError:
     HAS_HYBRID = False
@@ -89,6 +89,22 @@ train_loader, valid_loader, test_loader, dataset_info, fp = get_rich_dataloaders
     batch_size=BATCH_SIZE
 )
 
+# Top-K 评估数据（用于所有模型的统一评估）
+eval_data, eval_info, fp_topk, interaction_extractor = get_topk_eval_data(
+    data_dir='./data',
+    dataset_name='ml-100k',
+    max_seq_length=MAX_SEQ_LENGTH
+)
+
+# 加载原始交互数据（用于LightGBM，确保样本划分一致性）
+data_path = os.path.join('./data', 'ml-100k')
+interactions = pd.read_csv(
+    os.path.join(data_path, 'u.data'),
+    sep='\t',
+    names=['user_id', 'item_id', 'rating', 'timestamp']
+)
+lgb_interaction_extractor = InteractionFeatureExtractor(interactions)
+
 # ========================================
 # 1. DIN
 # ========================================
@@ -98,6 +114,7 @@ print("🚀 模型 1: DIN")
 print("=" * 80)
 
 din_model = None  # 保存用于混合精排
+din_trainer = None  # 保存 trainer 用于 Top-K 评估
 
 try:
     model = DINRichLite(
@@ -122,9 +139,20 @@ try:
     test_metrics = trainer.evaluate(test_loader)
     speed = measure_inference_speed_rich(model, test_loader, DEVICE)
     
-    din_model = model  # 保存用于后续混合精排
+    # Top-K 评估
+    topk_metrics = trainer.evaluate_topk(
+        eval_data=eval_data,
+        feature_processor=fp_topk,
+        interaction_extractor=interaction_extractor,
+        max_seq_length=MAX_SEQ_LENGTH,
+        ks=[5, 10, 20],
+        show_progress=False
+    )
     
-    results.append({
+    din_model = model  # 保存用于后续混合精排
+    din_trainer = trainer
+    
+    result_entry = {
         'model': 'DIN',
         'test_auc': test_metrics['auc'],
         'test_logloss': test_metrics['logloss'],
@@ -132,9 +160,12 @@ try:
         'qps': speed['qps'],
         'num_params': sum(p.numel() for p in model.parameters()),
         'status': 'success'
-    })
+    }
+    result_entry.update(topk_metrics)
+    results.append(result_entry)
     
     print(f"\n✅ 完成! AUC: {test_metrics['auc']:.4f}, QPS: {speed['qps']:.0f}")
+    print(f"   Top-K: HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
     
 except Exception as e:
     print(f"❌ 错误: {e}")
@@ -182,7 +213,17 @@ try:
     test_metrics = trainer.evaluate(test_loader)
     speed = measure_inference_speed_rich(model, test_loader, DEVICE)
     
-    results.append({
+    # Top-K 评估
+    topk_metrics = trainer.evaluate_topk(
+        eval_data=eval_data,
+        feature_processor=fp_topk,
+        interaction_extractor=interaction_extractor,
+        max_seq_length=MAX_SEQ_LENGTH,
+        ks=[5, 10, 20],
+        show_progress=False
+    )
+    
+    result_entry = {
         'model': 'GRU4Rec',
         'test_auc': test_metrics['auc'],
         'test_logloss': test_metrics['logloss'],
@@ -190,9 +231,12 @@ try:
         'qps': speed['qps'],
         'num_params': sum(p.numel() for p in model.parameters()),
         'status': 'success'
-    })
+    }
+    result_entry.update(topk_metrics)
+    results.append(result_entry)
     
     print(f"\n✅ 完成! AUC: {test_metrics['auc']:.4f}, QPS: {speed['qps']:.0f}")
+    print(f"   Top-K: HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
     
 except Exception as e:
     print(f"❌ 错误: {e}")
@@ -239,7 +283,17 @@ try:
     test_metrics = trainer.evaluate(test_loader)
     speed = measure_inference_speed_rich(model, test_loader, DEVICE)
     
-    results.append({
+    # Top-K 评估
+    topk_metrics = trainer.evaluate_topk(
+        eval_data=eval_data,
+        feature_processor=fp_topk,
+        interaction_extractor=interaction_extractor,
+        max_seq_length=MAX_SEQ_LENGTH,
+        ks=[5, 10, 20],
+        show_progress=False
+    )
+    
+    result_entry = {
         'model': 'AvgPool',
         'test_auc': test_metrics['auc'],
         'test_logloss': test_metrics['logloss'],
@@ -247,10 +301,12 @@ try:
         'qps': speed['qps'],
         'num_params': sum(p.numel() for p in model.parameters()),
         'status': 'success'
-    })
+    }
+    result_entry.update(topk_metrics)
+    results.append(result_entry)
     
     print(f"\n✅ 完成! AUC: {test_metrics['auc']:.4f}, QPS: {speed['qps']:.0f}")
-    
+    print(f"   Top-K: HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
     
 except Exception as e:
     print(f"❌ 错误: {e}")
@@ -274,38 +330,30 @@ print("\n" + "=" * 80)
 print("🚀 模型 4: LightGBM（特征工程 + 树模型）")
 print("=" * 80)
 
+lgb_model = None  # 保存用于后续Top-K评估
+
 try:
     import lightgbm as lgb
     
-    # 加载原始交互数据
-    data_path = os.path.join('./data', 'ml-100k')
-    interactions = pd.read_csv(
-        os.path.join(data_path, 'u.data'),
-        sep='\t',
-        names=['user_id', 'item_id', 'rating', 'timestamp']
-    )
-    
-    # 准备 LightGBM 特征
+    # 准备 LightGBM 特征（使用已加载的交互数据，确保一致性）
     print("准备 LightGBM 特征...")
-    feature_processor = fp
-    interaction_extractor = InteractionFeatureExtractor(interactions)
     
     X, y, feature_names = prepare_lightgbm_features(
         interactions,
-        feature_processor,
-        interaction_extractor,
+        fp,  # 使用与深度模型相同的特征处理器
+        lgb_interaction_extractor,  # 使用预先创建的交互提取器
         max_seq_length=MAX_SEQ_LENGTH
     )
     
     print(f"特征矩阵形状: {X.shape}")
-    print(f"特征名: {feature_names}")
+    print(f"特征数: {len(feature_names)}")
     
-    # 划分数据
+    # 划分数据（与DataLoader划分比例一致：80% train, 10% valid, 10% test）
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=2020
     )
     X_train, X_valid, y_train, y_valid = train_test_split(
-        X_train, y_train, test_size=0.125, random_state=2020
+        X_train, y_train, test_size=0.125, random_state=2020  # 0.8 * 0.125 = 0.1
     )
     
     print(f"训练集: {len(X_train)}, 验证集: {len(X_valid)}, 测试集: {len(X_test)}")
@@ -328,7 +376,7 @@ try:
     valid_data = lgb.Dataset(X_valid, label=y_valid, feature_name=feature_names)
     
     t1 = time.time()
-    model = lgb.train(
+    lgb_model = lgb.train(
         params,
         train_data,
         num_boost_round=500,
@@ -337,32 +385,44 @@ try:
     )
     train_time = time.time() - t1
     
-    # 评估
-    y_pred = model.predict(X_test)
+    # CTR 评估
+    y_pred = lgb_model.predict(X_test)
     test_auc = roc_auc_score(y_test, y_pred)
     test_logloss = log_loss(y_test, np.clip(y_pred, 1e-7, 1-1e-7))
     
     # QPS
     t1 = time.time()
-    _ = model.predict(X_test[:1000])
+    _ = lgb_model.predict(X_test[:1000])
     qps = 1000 / (time.time() - t1 + 1e-6)
     
-    results.append({
+    # Top-K 评估（使用 LightGBMRanker）
+    print("\n进行 Top-K 评估...")
+    lgb_ranker = LightGBMRanker(lgb_model, fp_topk, interaction_extractor)
+    topk_metrics = lgb_ranker.evaluate_topk(
+        eval_data=eval_data,
+        max_seq_length=MAX_SEQ_LENGTH,
+        ks=(5, 10, 20)
+    )
+    
+    result_entry = {
         'model': 'LightGBM',
         'test_auc': test_auc,
         'test_logloss': test_logloss,
         'train_time_sec': train_time,
         'qps': qps,
-        'num_params': model.num_trees() * params['num_leaves'],
+        'num_params': lgb_model.num_trees() * params['num_leaves'],
         'status': 'success'
-    })
+    }
+    result_entry.update(topk_metrics)
+    results.append(result_entry)
     
     print(f"\n✅ 完成! AUC: {test_auc:.4f}, QPS: {qps:.0f}")
+    print(f"   Top-K: HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
     
     # 特征重要性
     importance = pd.DataFrame({
         'feature': feature_names,
-        'importance': model.feature_importance()
+        'importance': lgb_model.feature_importance()
     }).sort_values('importance', ascending=False)
     print("\n特征重要性 Top 10:")
     print(importance.head(10).to_string(index=False))
@@ -406,10 +466,15 @@ if din_model is not None and HAS_HYBRID:
         
         t1 = time.time()
         
-        # 创建混合精排器
-        hybrid_ranker = HybridRanker(din_model, device=DEVICE)
+        # 创建混合精排器（传入特征处理器，确保特征一致性）
+        hybrid_ranker = HybridRanker(
+            din_model, 
+            device=DEVICE,
+            feature_processor=fp_topk,
+            interaction_extractor=interaction_extractor
+        )
         
-        # 训练
+        # 训练（DIN嵌入提取 + LightGBM训练，自动触发Pipeline）
         hybrid_ranker.fit(
             train_loader, 
             valid_loader,
@@ -419,27 +484,58 @@ if din_model is not None and HAS_HYBRID:
         
         train_time = time.time() - t1
         
-        # 评估
+        # CTR 评估
         test_results = hybrid_ranker.evaluate(test_loader)
         
-        # QPS (简单估算)
-        qps = 5000  # 混合模型需要两步推理
+        # Top-K 评估
+        topk_metrics = hybrid_ranker.evaluate_topk(
+            eval_data=eval_data,
+            feature_processor=fp_topk,
+            interaction_extractor=interaction_extractor,
+            max_seq_length=MAX_SEQ_LENGTH,
+            ks=(5, 10, 20),
+            device=DEVICE
+        )
+        
+        # QPS (简单估算：DIN推理 + LightGBM推理)
+        qps = 5000
         
         # 与纯 DIN 对比
         comparison = hybrid_ranker.compare_with_din()
         
-        results.append({
+        # 获取特征重要性（Top 20）
+        feature_importance = hybrid_ranker.get_feature_importance(20)
+        feature_importance_dict = {name: float(imp) for name, imp in feature_importance}
+        
+        result_entry = {
             'model': 'Hybrid',
             'test_auc': test_results['auc'],
             'test_logloss': test_results['logloss'],
             'train_time_sec': train_time,
+            'din_train_time': din_train_time if 'din_train_time' in dir() else None,
+            'lgb_train_time': train_time - (din_train_time if 'din_train_time' in dir() else 0),
             'qps': qps,
             'num_params': hybrid_ranker.lgb_model.num_trees() * 31,
-            'status': 'success'
-        })
+            'din_num_params': din_model.count_parameters() if hasattr(din_model, 'count_parameters') else 233463,
+            'lgb_num_params': hybrid_ranker.lgb_model.num_trees() * 31,
+            'status': 'success',
+            # 可解释性分析结果
+            'feature_importance_top20': feature_importance_dict,
+            'din_vs_hybrid_auc_diff': comparison['auc_improvement'],
+            'embedding_dim': hybrid_ranker.embedding_dim,
+            'num_explicit_features': len(hybrid_ranker.feature_names) - hybrid_ranker.embedding_dim - 1,
+        }
+        result_entry.update(topk_metrics)
+        results.append(result_entry)
         
         print(f"\n✅ 完成! AUC: {test_results['auc']:.4f}")
         print(f"   相对 DIN 提升: {comparison['auc_improvement']:+.2f}%")
+        print(f"   Top-K: HR@10={topk_metrics['HR@10']:.4f}, NDCG@10={topk_metrics['NDCG@10']:.4f}")
+        
+        # 特征重要性分析
+        print("\n混合模型特征重要性 Top 20:")
+        for i, (name, imp) in enumerate(feature_importance, 1):
+            print(f"  {i:2d}. {name}: {imp:.2f}")
         
     except Exception as e:
         print(f"❌ 错误: {e}")
